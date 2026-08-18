@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build release artifacts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned SQL engine source
+        shell: bash
+        run: ./scripts/fetch-sqlite.sh
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential make curl unzip python3 libssl-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          "$HOME/vcpkg/vcpkg" install --triplet x64-osx
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:USERPROFILE\vcpkg"
+          & "$env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:USERPROFILE\vcpkg\vcpkg.exe" install --triplet x64-windows
+
+      - name: Configure + Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOTSARDB_ENABLE_S3=ON \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake --build build --parallel
+
+      - name: Configure + Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OPENSSL_ROOT=""
+          if [ -d "/usr/local/opt/openssl@3" ]; then OPENSSL_ROOT="/usr/local/opt/openssl@3"; fi
+          if [ -d "/opt/homebrew/opt/openssl@3" ]; then OPENSSL_ROOT="/opt/homebrew/opt/openssl@3"; fi
+          CMAKE_ARGS=""
+          if [ -n "$OPENSSL_ROOT" ]; then CMAKE_ARGS="-DOPENSSL_ROOT_DIR=$OPENSSL_ROOT"; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOTSARDB_ENABLE_S3=ON $CMAKE_ARGS \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake --build build --parallel
+
+      - name: Configure + Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $opensslRoot = "C:\Program Files\OpenSSL-Win64"
+          if (-not (Test-Path $opensslRoot)) { $opensslRoot = "C:\Program Files\OpenSSL" }
+          if (-not (Test-Path $opensslRoot)) { $opensslRoot = "C:\Program Files\OpenSSL-Win64\OpenSSL" }
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOTSARDB_ENABLE_S3=ON `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:USERPROFILE\vcpkg\scripts\buildsystems\vcpkg.cmake"
+          cmake --build build --config Release --parallel
+
+      - name: Smoke test (SQL)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="build/Release/otsardb.exe"; [ -f "$BIN" ] || BIN="build/otsardb.exe"; else BIN="build/otsardb"; fi
+          "$BIN" :memory: "CREATE TABLE t(x); INSERT INTO t VALUES(42); SELECT x FROM t;" | grep -q 42
+
+      - name: Smoke test (S3 support present)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="build/Release/otsardb.exe"; [ -f "$BIN" ] || BIN="build/otsardb.exe"; else BIN="build/otsardb"; fi
+          "$BIN" --version
+          "$BIN" s3://example-bucket/x --help >/dev/null 2>&1 || true
+          # The binary must be S3-enabled: pointing at a closed local port
+          # must fail fast with a network error, NOT "built without native
+          # S3 support". No DNS, no retries, no hangs.
+          OTSARDB_S3_ENDPOINT="http://127.0.0.1:1" \
+            OUT="$("$BIN" s3://example-bucket/x "SELECT 1;" 2>&1 || true)"
+          echo "$OUT"
+          if echo "$OUT" | grep -qi "without native S3"; then
+            echo "RELEASE BINARY MISSING S3 SUPPORT" >&2
+            exit 1
+          fi
+
+      - name: Test (CTest release gate)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ctest --test-dir build -C Release --output-on-failure
+          else
+            ctest --test-dir build --output-on-failure
+          fi
+
+      - name: Compute release metadata (standard multi-OS release layout)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="build/Release/otsardb.exe"; [ -f "$BIN" ] || BIN="build/otsardb.exe"; else BIN="build/otsardb"; fi
+          VERSION_LINE="$("$BIN" --version 2>/dev/null | head -n 1)"
+          REF="${GITHUB_REF_NAME#v}"
+          case "$REF" in
+            [0-9]*.[0-9]*.[0-9]*) VERSION="$REF" ;;
+            *) VERSION="$(printf '%s' "$VERSION_LINE" | awk '{print $2}' | tr -c 'A-Za-z0-9._-' '-')" ;;
+          esac
+          BINARY_VERSION="$(printf '%s' "$VERSION_LINE" | awk '{print $2}')"
+          if printf '%s' "$REF" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$' && [ "$BINARY_VERSION" != "$VERSION" ]; then
+            echo "RELEASE VERSION MISMATCH: tag=$VERSION binary=$BINARY_VERSION" >&2
+            echo "Update src/core/otsardb.c before publishing this release." >&2
+            exit 1
+          fi
+          case "$RUNNER_OS" in
+            Linux) OS_TAG="linux" ;;
+            Windows) OS_TAG="windows" ;;
+            macOS) OS_TAG="macos" ;;
+            *) OS_TAG="$(echo "$RUNNER_OS" | tr 'A-Z' 'a-z')" ;;
+          esac
+          ARCH="$(echo "$RUNNER_ARCH" | tr 'A-Z' 'a-z')"
+          COMMIT="${GITHUB_SHA}"
+          DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "OS_TAG=$OS_TAG" >> "$GITHUB_ENV"
+          echo "ARCH=$ARCH" >> "$GITHUB_ENV"
+          echo "VERSION_LINE=$VERSION_LINE" >> "$GITHUB_ENV"
+          echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
+          echo "DATE_UTC=$DATE_UTC" >> "$GITHUB_ENV"
+          echo "asset name: otsardb-${VERSION}-${OS_TAG}-${ARCH}"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ASSET="otsardb-${VERSION}-${OS_TAG}-${ARCH}"
+          if command -v sha256sum >/dev/null 2>&1; then HASHTOOL="sha256sum"; else HASHTOOL="shasum -a 256"; fi
+          mkdir -p dist
+          cp build/otsardb dist/otsardb
+          cp include/otsardb.h LICENSE README.md docs/guides/QUICKSTART_BETA.md docs/guides/KNOWN_LIMITATIONS.md docs/guides/STUDIO.md dist/
+          BINARY_HASH="$($HASHTOOL dist/otsardb | awk '{print $1}')"
+          {
+            echo "OtsarDB release package manifest (standard multi-OS release layout)"
+            echo "================================================"
+            echo "asset           : $ASSET.tar.gz"
+            echo "release_version : $VERSION"
+            echo "date_utc        : $DATE_UTC"
+            echo "commit_sha      : $COMMIT"
+            echo "version         : $VERSION_LINE"
+            echo "binary_sha256   : $BINARY_HASH"
+            echo "build_config    : OTSARDB_ENABLE_S3=ON; Release; ${{ runner.os }} ${{ runner.arch }}"
+            echo "os              : $OS_TAG $ARCH"
+          } > dist/MANIFEST.txt
+          tar -czf "$ASSET.tar.gz" -C dist .
+          ZIP_HASH="$($HASHTOOL "$ASSET.tar.gz" | awk '{print $1}')"
+          {
+            echo "SHA256SUMS.txt for OtsarDB release $VERSION (standard multi-OS release layout)"
+            echo "generated_utc : $DATE_UTC"
+            echo "commit_sha    : $COMMIT"
+            echo ""
+            echo "$BINARY_HASH  otsardb"
+            echo "$ZIP_HASH  $ASSET.tar.gz"
+          } > SHA256SUMS.txt
+          ls -la "$ASSET.tar.gz" SHA256SUMS.txt
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $asset = "otsardb-$env:VERSION-$env:OS_TAG-$env:ARCH"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item build\Release\otsardb.exe dist\otsardb.exe -ErrorAction SilentlyContinue
+          if (-not (Test-Path dist\otsardb.exe)) { Copy-Item build\otsardb.exe dist\otsardb.exe }
+          Copy-Item include\otsardb.h, LICENSE, README.md, docs\guides\QUICKSTART_BETA.md, docs\guides\KNOWN_LIMITATIONS.md, docs\guides\STUDIO.md dist\
+          # Ship the OpenSSL and MinIO runtime DLLs so the binary is standalone.
+          Get-ChildItem "C:\Program Files\OpenSSL*" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "libcrypto|libssl" } | ForEach-Object { Copy-Item $_.FullName dist\ }
+          Get-ChildItem "$env:USERPROFILE\vcpkg\installed\x64-windows\bin" -Filter "*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName dist\ }
+          $binaryHash = (Get-FileHash dist\otsardb.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestLines = @(
+            'OtsarDB release package manifest (standard multi-OS release layout)',
+            '================================================',
+            "asset           : $asset.zip",
+            "release_version : $env:VERSION",
+            "date_utc        : $env:DATE_UTC",
+            "commit_sha      : $env:COMMIT",
+            "version         : $env:VERSION_LINE",
+            "binary_sha256   : $binaryHash",
+            "build_config    : OTSARDB_ENABLE_S3=ON; Release; ${{ runner.os }} ${{ runner.arch }}",
+            "os              : $env:OS_TAG $env:ARCH"
+          )
+          [IO.File]::WriteAllText("dist\MANIFEST.txt", ($manifestLines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+          Compress-Archive -Path dist\* -DestinationPath "$asset.zip" -Force
+          $zipHash = (Get-FileHash "$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sums = "SHA256SUMS.txt for OtsarDB release $env:VERSION (standard multi-OS release layout)`r`n" +
+                  "generated_utc : $env:DATE_UTC`r`n" +
+                  "commit_sha    : $env:COMMIT`r`n" +
+                  "`r`n" +
+                  "$binaryHash  otsardb.exe`r`n" +
+                  "$zipHash  $asset.zip`r`n"
+          [IO.File]::WriteAllText("SHA256SUMS.txt", $sums, (New-Object System.Text.UTF8Encoding($false)))
+          Get-ChildItem *.zip, SHA256SUMS.txt | Select-Object Name, Length
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: otsardb-${{ runner.os }}-${{ github.ref_name }}
+          path: |
+            otsardb-*.tar.gz
+            otsardb-*.zip
+            SHA256SUMS.txt
+          if-no-files-found: error

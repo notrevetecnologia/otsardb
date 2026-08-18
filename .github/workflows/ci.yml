@@ -1,0 +1,183 @@
+name: CI
+
+# OPTIONAL manual validation only (owner direction, evidence rule R7):
+# the acceptance gate is observed behavior on real endpoints and local
+# gates (ci-local, soak, concurrency, validate-all-providers). This
+# workflow runs only when dispatched manually, so a missing green badge
+# is never a validation gap.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential curl unzip python3 libssl-dev
+
+      - name: Fetch pinned SQL engine source
+        run: ./scripts/fetch-sqlite.sh
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Persistence smoke test
+        run: |
+          ./build/otsardb /tmp/otsardb-ci.db "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users(name) VALUES('OtsarDB');"
+          test "$(./build/otsardb /tmp/otsardb-ci.db 'SELECT name FROM users;')" = "OtsarDB"
+
+  s3-build:
+    runs-on: ubuntu-latest
+    env:
+      OTSARDB_S3_ENDPOINT: http://127.0.0.1:9000
+      OTSARDB_S3_REGION: us-east-1
+      # Ephemeral local-MinIO TEST credentials: the workflow starts its own
+      # throwaway MinIO; the fallback values are test-only and never touch
+      # real storage.
+      OTSARDB_S3_BUCKET: otsardb-ci
+      OTSARDB_S3_ACCESS_KEY: ${{ secrets.OTSARDB_CI_ACCESS_KEY || 'otsardb-ci' }}
+      OTSARDB_S3_SECRET_KEY: ${{ secrets.OTSARDB_CI_SECRET_KEY || 'otsardb-ci-secret' }}
+      OTSARDB_S3_PREFIX: integration
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install S3 build dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake build-essential curl unzip python3 libssl-dev git python3-pip
+          python3 -m pip install --user --break-system-packages awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ~/vcpkg
+          key: "vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}"
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        run: |
+          if [ ! -f "$HOME/vcpkg/vcpkg" ]; then
+            rm -rf "$HOME/vcpkg"
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+            "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+      - name: Install S3 client dependencies
+        run: |
+          "$HOME/vcpkg/vcpkg" install --triplet x64-linux
+
+      - name: Fetch pinned SQL engine source
+        run: ./scripts/fetch-sqlite.sh
+
+      - name: Configure with native S3
+        run: |
+          cmake -S . -B build-s3 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOTSARDB_ENABLE_S3=ON \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build with native S3
+        run: cmake --build build-s3 --parallel
+
+      - name: Verify S3 tools
+        run: |
+          test -x build-s3/otsardb
+          test -x build-s3/otsardb-s3-probe
+          test -x build-s3/otsardb-s3-wal-e2e
+
+      - name: Run deterministic tests in S3 build
+        run: ctest --test-dir build-s3 --output-on-failure
+
+      - name: Start disposable S3-compatible endpoint
+        run: |
+          docker run -d --name otsardb-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=${{ secrets.OTSARDB_CI_ACCESS_KEY || 'otsardb-ci' }} \
+            -e MINIO_ROOT_PASSWORD=${{ secrets.OTSARDB_CI_SECRET_KEY || 'otsardb-ci-secret' }} \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs otsardb-minio
+          exit 1
+
+      - name: Create integration bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OTSARDB_CI_ACCESS_KEY || 'otsardb-ci' }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OTSARDB_CI_SECRET_KEY || 'otsardb-ci-secret' }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://otsardb-ci
+
+      - name: Probe live S3 endpoint
+        run: |
+          output="$(./build-s3/otsardb-s3-probe)"
+          printf '%s\n' "$output"
+          grep -q '^S3 Core: yes$' <<<"$output"
+          grep -q '^S3 CAS: yes$' <<<"$output"
+          grep -q '^OtsarDB write strategy: CAS$' <<<"$output"
+
+      - name: Existing SQL-WAL-S3 recovery integration
+        run: ./build-s3/otsardb-s3-wal-e2e
+
+      - name: Native s3 URI zero-local reopen
+        run: |
+          rm -rf /tmp/otsardb-native-cache-a /tmp/otsardb-native-cache-b
+          export OTSARDB_CACHE_DIR=/tmp/otsardb-native-cache-a
+          ./build-s3/otsardb s3://otsardb-ci/native-cli/orders \
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO items(value) VALUES('native-s3-ok');"
+
+          rm -rf /tmp/otsardb-native-cache-a
+          export OTSARDB_CACHE_DIR=/tmp/otsardb-native-cache-b
+          output="$(./build-s3/otsardb s3://otsardb-ci/native-cli/orders 'SELECT value FROM items;')"
+          test "$output" = "native-s3-ok"
+
+          if ./build-s3/otsardb s3://otsardb-ci/native-cli/orders "PRAGMA synchronous=OFF;"; then
+            echo "OtsarDB incorrectly allowed synchronous=OFF on an S3 database" >&2
+            exit 1
+          fi
+
+      - name: Clean up MinIO container
+        if: always()
+        run: docker rm -f otsardb-minio 2>/dev/null || true
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned SQL engine source
+        run: bash ./scripts/fetch-sqlite.sh
+
+      - name: Install OpenSSL
+        run: choco install openssl -y --no-progress
+
+      - name: Configure
+        run: |
+          $opensslRoot = "C:\Program Files\OpenSSL-Win64"
+          if (-not (Test-Path $opensslRoot)) { $opensslRoot = "C:\Program Files\OpenSSL" }
+          if (-not (Test-Path $opensslRoot)) { $opensslRoot = "C:\Program Files\OpenSSL-Win64\OpenSSL" }
+          cmake -S . -B build -A x64 `
+            -DOTSARDB_ENABLE_S3=OFF `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure

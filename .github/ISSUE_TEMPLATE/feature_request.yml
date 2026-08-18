@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a capability or improvement for OtsarDB
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing, check the known limitations list and the existing
+        issues. OtsarDB changes are engineering-recorded:
+        the maintainers will map accepted proposals to the project's
+        change-record history.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What cannot you do today, or what is painful? A concrete scenario beats a generic ask.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should OtsarDB do, and how should it behave (CLI/API, S3 semantics, failure modes)?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or similar solutions you know of (describe the approach)
+  - type: textarea
+    id: validation
+    attributes:
+      label: How it could be validated
+      description: Concrete tests, endpoints, or acceptance criteria you would expect (OBSERVED vs UNTESTED discipline)

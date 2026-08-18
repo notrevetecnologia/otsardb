@@ -1,0 +1,25 @@
+/build/
+/build-s3/
+/vendor/sqlite/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# test harness provider credentials + recorded result artifacts
+/scripts/providers.json
+/scripts/*.run.json
+/scripts/validation-results/
+/build-linux/
+/vcpkg_installed/
+/build-fresh/
+/build-asan/
