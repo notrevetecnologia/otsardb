@@ -1,0 +1,27 @@
+# Third-Party Notices
+
+OtsarDB is derived from SQLite and links the following third-party components.
+Their license terms remain with their respective authors.
+
+## SQLite
+
+The SQL engine ancestry (SQL parsing, planner, VM, B-tree and file format) is
+derived from SQLite, which is released into the public domain. SQLite is
+available at https://sqlite.org.
+
+## miniocpp
+
+The S3-compatible object-storage client is provided by miniocpp, licensed
+under the Apache License 2.0 (http://www.apache.org/licenses/LICENSE-2.0),
+obtained via vcpkg (port `minio-cpp`).
+
+## LZ4
+
+Segment compression uses LZ4, licensed under the BSD 2-Clause License,
+vendored under `vendor/lz4`.
+
+## Transitive dependencies
+
+The following are obtained via vcpkg and carry their own permissive licenses:
+curl (MIT), OpenSSL (Apache-2.0), zlib (Zlib), pugixml (MIT),
+nlohmann-json (MIT), inih (BSD-3-Clause).

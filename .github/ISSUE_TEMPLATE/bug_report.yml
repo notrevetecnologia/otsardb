@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible defect in OtsarDB
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Security
+        issues must NOT be filed here — use the repository's private
+        vulnerability reporting (SECURITY.md) instead.
+
+        OtsarDB claims are evidence-classified (evidence rule R1): if you
+        observed a failure, include the exact commands and output so it
+        can be replayed.
+  - type: input
+    id: version
+    attributes:
+      label: OtsarDB version
+      description: Output of `otsardb --version` (e.g. `otsardb 0.1.0-dev (engine base 3.53.4)`)
+      placeholder: otsardb 0.1.0-dev (engine base 3.53.4)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows x64
+        - Linux x64
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Database target
+      description: Local file, `:memory:`, or `s3://bucket/root` (omit credentials and bucket names if sensitive)
+      placeholder: s3://my-bucket/db
+  - type: input
+    id: provider
+    attributes:
+      label: S3 provider (if applicable)
+      description: MinIO, Cloudflare R2, Wasabi, Magalu Cloud, AWS, B2, other — and region
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands with any OTSARDB_S3_* environment variables you set. Never paste real access/secret keys (R5).
+      placeholder: |
+        1. $env:OTSARDB_S3_ENDPOINT = "http://127.0.0.1:9000"
+        2. otsardb s3://... "CREATE TABLE ..."
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen (include expected output if applicable)
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead (include exit codes and output; strip diagnostics if they contain paths or keys)
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Build config, commit SHA, logs (without secrets), relevant known-limitation notes
